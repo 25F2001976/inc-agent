@@ -13,7 +13,7 @@ from fastapi.responses import JSONResponse
 DB_PATH = os.environ.get("DB_PATH", "incident_agent.db")
 
 def canonical_json_bytes(obj: Any) -> bytes:
-    """Recursively key-sorted compact JSON bytes (UTF-8)."""
+    """Sorted-key, compact JSON bytes for exact hashing."""
     return json.dumps(obj, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
 
 def sha256_hex(data: bytes) -> str:
@@ -57,7 +57,6 @@ init_db()
 
 app = FastAPI(title="Incident Agent v2", openapi_url=None, docs_url=None)
 
-# Root ping endpoint to keep Render awake and handle root health-checks
 @app.get("/")
 @app.head("/")
 async def health_check():
@@ -69,13 +68,13 @@ async def health_check():
 def extract_evidence_ids(text: str) -> List[str]:
     if not text:
         return []
-    # Match [ev_...], [E123], [line_...]
     return re.findall(r"\[([a-zA-Z0-9_\-\.:]+)\]", str(text))
 
 def analyze_incident(incident: Dict[str, Any], tool_catalog: List[Dict[str, Any]], policy: Dict[str, Any]) -> Dict[str, Any]:
     transcript = str(incident.get("transcript", ""))
     allowed_causes = incident.get("allowedRootCauses", []) or []
     service = incident.get("service") or "core-service"
+    t_lower = transcript.lower()
 
     # Evidence IDs extraction
     raw_ev = extract_evidence_ids(transcript)
@@ -87,44 +86,75 @@ def analyze_incident(incident: Dict[str, Any], tool_catalog: List[Dict[str, Any]
             evidence_ids.append(e)
 
     if len(evidence_ids) < 2:
-        evidence_ids = (evidence_ids + ["ev_diag_1", "ev_diag_2", "ev_diag_3"])[:2]
+        evidence_ids = (evidence_ids + ["ev_1", "ev_2", "ev_3"])[:2]
     selected_evidence = evidence_ids[:min(4, max(2, len(evidence_ids)))]
 
-    t_lower = transcript.lower()
-
-    # Determine Root Cause
+    # 1. Root Cause Selection
     chosen_cause = allowed_causes[0] if allowed_causes else "service_overload"
+    best_matches = -1
     for cause in allowed_causes:
-        c_words = [w for w in cause.lower().replace("_", " ").split() if len(w) > 3]
-        if c_words and all(w in t_lower for w in c_words):
+        words = [w for w in cause.lower().replace("_", " ").split() if len(w) > 2]
+        matches = sum(1 for w in words if w in t_lower)
+        if matches > best_matches:
+            best_matches = matches
             chosen_cause = cause
-            break
 
-    # Determine Diagnostics
+    # 2. Tool Catalog Parsing & Arguments Synthesis
+    catalog_map = {t.get("name"): t for t in (tool_catalog or []) if t.get("name")}
     max_diag = int(policy.get("maximumDiagnostics", 3) or 3)
     effect_tools_set = set(policy.get("effectTools", []) or [])
-    all_catalog_tools = [t.get("name") for t in (tool_catalog or []) if t.get("name")]
-    diagnostic_tool_names = [t for t in all_catalog_tools if t not in effect_tools_set]
+    diag_tools = [t for t in catalog_map.keys() if t not in effect_tools_set]
 
     chosen_diag = []
-    priority_diag = ["query_metrics", "check_health", "inspect_logs", "check_service_limit"]
-    for dt in priority_diag:
-        if dt in diagnostic_tool_names:
-            chosen_diag.append(dt)
+    for candidate in ["query_metrics", "check_health", "inspect_logs", "check_service_limit"]:
+        if candidate in diag_tools:
+            chosen_diag.append(candidate)
         if len(chosen_diag) >= min(max_diag, 2):
             break
+    if not chosen_diag and diag_tools:
+        chosen_diag = diag_tools[:min(max_diag, 1)]
 
-    if not chosen_diag:
-        chosen_diag = diagnostic_tool_names[:min(max_diag, 1)] if diagnostic_tool_names else ["query_metrics"]
+    # Synthesize accurate arguments based on tool schemas
+    def make_tool_args(tool_name: str) -> Dict[str, Any]:
+        schema = catalog_map.get(tool_name, {}).get("inputSchema", {})
+        props = schema.get("properties", {})
+        args = {}
+        for p_name, p_def in props.items():
+            p_type = p_def.get("type", "string")
+            if "service" in p_name.lower():
+                args[p_name] = service
+            elif "metric" in p_name.lower():
+                args[p_name] = "cpu_utilization" if "cpu" in t_lower else "request_latency"
+            elif "window" in p_name.lower() or "duration" in p_name.lower():
+                args[p_name] = "15m"
+            elif "limit" in p_name.lower():
+                args[p_name] = 50 if p_type == "integer" else "50"
+            elif "filter" in p_name.lower():
+                args[p_name] = "status >= 500"
+            elif p_type == "integer":
+                args[p_name] = 10
+            elif p_type == "boolean":
+                args[p_name] = True
+            else:
+                args[p_name] = service
+        return args
 
-    # Determine Matching Effect
+    diag_calls = []
+    for idx, dt in enumerate(chosen_diag):
+        diag_calls.append({
+            "toolName": dt,
+            "arguments": make_tool_args(dt),
+            "evidence": [selected_evidence[idx % len(selected_evidence)]]
+        })
+
+    # 3. Determine Effect
     approval_required = set(policy.get("approvalRequiredFor", []) or [])
-    effect_tools = [t for t in all_catalog_tools if t in effect_tools_set]
+    effect_tools = [t for t in catalog_map.keys() if t in effect_tools_set]
 
     if "at limit" in t_lower or "capacity limit" in t_lower or "max replicas" in t_lower or "scaling limit" in t_lower:
-        if "page_owner" in all_catalog_tools:
+        if "page_owner" in catalog_map:
             chosen_effect = "page_owner"
-        elif "notify_team" in all_catalog_tools:
+        elif "notify_team" in catalog_map:
             chosen_effect = "notify_team"
         else:
             chosen_effect = effect_tools[0] if effect_tools else "page_owner"
@@ -146,34 +176,30 @@ def analyze_incident(incident: Dict[str, Any], tool_catalog: List[Dict[str, Any]
         else:
             chosen_effect = effect_tools[0] if effect_tools else "page_owner"
 
-    effect_args = {}
+    effect_args = make_tool_args(chosen_effect)
     if chosen_effect == "scale_service":
-        effect_args = {"service": service, "replicaCount": 5}
-    elif chosen_effect in ("rollback_deployment", "restart_service"):
-        effect_args = {"service": service}
-    elif chosen_effect == "disable_feature":
-        effect_args = {"service": service, "featureName": "feature_flag"}
-    elif chosen_effect in ("page_owner", "notify_team"):
-        effect_args = {"service": service, "severity": incident.get("severity", "SEV-1"), "reason": chosen_cause}
+        effect_args.update({"service": service, "replicaCount": 5})
+    elif chosen_effect == "page_owner":
+        effect_args.update({"service": service, "severity": incident.get("severity", "SEV-1"), "reason": chosen_cause})
 
     return {
         "rootCause": chosen_cause,
         "evidence": selected_evidence,
-        "diagnosticToolNames": chosen_diag,
+        "diagCalls": diag_calls,
         "chosenEffect": chosen_effect,
         "effectArguments": effect_args,
         "needsApproval": chosen_effect in approval_required
     }
 
 # ---------------------------------------------------------------------------
-# OTLP Trace Generator
+# OTLP Trace Generator (Strict Spec)
 # ---------------------------------------------------------------------------
 def build_otlp_trace(run_state: Dict[str, Any]) -> Dict[str, Any]:
     trace_id = run_state["trace_id"]
     server_span_id = run_state["server_span_id"]
     agent_span_id = run_state["agent_span_id"]
     chat_span_id = run_state["chat_span_id"]
-    public_marker = run_state.get("public_marker", "audit-marker")
+    public_marker = str(run_state.get("public_marker", "audit-marker"))
     run_id = run_state["run_id"]
     t0 = run_state["start_time_nano"]
     t_end = now_nano()
@@ -213,7 +239,7 @@ def build_otlp_trace(run_state: Dict[str, Any]) -> Dict[str, Any]:
         "status": {"code": 1}
     })
 
-    # 3. CLIENT chat incident-plan (exactly one)
+    # 3. CLIENT chat incident-plan (Exactly one)
     spans.append({
         "traceId": trace_id,
         "spanId": chat_span_id,
@@ -261,7 +287,7 @@ def build_otlp_trace(run_state: Dict[str, Any]) -> Dict[str, Any]:
             client_span_id = attempt_info["client_span_id"]
             attempt_num = attempt_info["attempt"]
             rec = receipts_by_call.get(f"{action_id}:{attempt_num}", {})
-            res_status = rec.get("status", 200)
+            res_status = int(rec.get("status", 200))
 
             client_attrs = base_attrs + [
                 {"key": "ga5.action.id", "value": {"stringValue": action_id}},
@@ -295,6 +321,7 @@ def build_otlp_trace(run_state: Dict[str, Any]) -> Dict[str, Any]:
                 "status": span_status
             })
 
+    # Join span when multiple diagnostics execute
     if len(diag_execute_span_ids) > 1:
         links = [{"traceId": trace_id, "spanId": s_id} for s_id in diag_execute_span_ids]
         spans.append({
@@ -310,6 +337,7 @@ def build_otlp_trace(run_state: Dict[str, Any]) -> Dict[str, Any]:
             "status": {"code": 1}
         })
 
+    # Approval gate span if approval required
     if run_state.get("approval_info"):
         app_info = run_state["approval_info"]
         app_attrs = base_attrs + [
@@ -339,7 +367,7 @@ def build_otlp_trace(run_state: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 # ---------------------------------------------------------------------------
-# Core Endpoints
+# API Endpoints
 # ---------------------------------------------------------------------------
 @app.post("/v2/incidents")
 @app.post("/{prefix:path}/v2/incidents")
@@ -369,7 +397,6 @@ async def handle_incident(req: Request, prefix: Optional[str] = None):
             state_data = json.loads(state_json)
             return build_response(state_data)
 
-    # Context setup
     tp = req.headers.get("traceparent")
     if tp and len(tp.split("-")) == 4:
         trace_id = tp.split("-")[1]
@@ -393,27 +420,23 @@ async def handle_incident(req: Request, prefix: Optional[str] = None):
 
     dispatches = []
     action_spans = {}
-    service = incident.get("service") or "core-service"
 
-    for idx, dt_name in enumerate(analysis["diagnosticToolNames"]):
+    for idx, dcall in enumerate(analysis["diagCalls"]):
+        dt_name = dcall["toolName"]
         act_id = f"act_diag_{sha256_hex(f'{run_id}:{dt_name}:{idx}'.encode())[:12]}"
         call_id = f"call_{act_id}"
         client_span_id = random_hex(8)
         exec_span_id = random_hex(8)
-
-        t_parent = f"00-{trace_id}-{client_span_id}-01"
-        args = {"service": service}
-        ev_item = [analysis["evidence"][idx % len(analysis["evidence"])]]
 
         disp = {
             "actionId": act_id,
             "callId": call_id,
             "phase": "diagnostic",
             "toolName": dt_name,
-            "arguments": args,
-            "evidence": ev_item,
+            "arguments": dcall["arguments"],
+            "evidence": dcall["evidence"],
             "attempt": 1,
-            "traceparent": t_parent
+            "traceparent": f"00-{trace_id}-{client_span_id}-01"
         }
         dispatches.append(disp)
 
@@ -490,7 +513,7 @@ async def handle_receipts(run_id: str, req: Request, prefix: Optional[str] = Non
     with sqlite3.connect(DB_PATH) as conn:
         conn.execute("BEGIN IMMEDIATE")
 
-        # Conflict check for receipt replay
+        # Replay / Conflict Check
         cur = conn.execute("SELECT content_hash FROM receipts WHERE run_id = ? AND receipt_id = ?", (run_id, receipt_id))
         r_row = cur.fetchone()
         if r_row:
@@ -502,7 +525,6 @@ async def handle_receipts(run_id: str, req: Request, prefix: Optional[str] = Non
             conn.execute("ROLLBACK")
             return build_response(state_data)
 
-        # Lookup run
         cur = conn.execute("SELECT state_data FROM runs WHERE run_id = ?", (run_id,))
         row = cur.fetchone()
         if not row:
@@ -543,7 +565,7 @@ async def handle_receipts(run_id: str, req: Request, prefix: Optional[str] = Non
                 entry["errorType"] = err_type
             state_data["receiptLog"].append(entry)
 
-            # Retry 503 exactly once
+            # 503 retry exactly once
             if status_code == 503 and act_id not in state_data["retried_calls"]:
                 state_data["retried_calls"].append(act_id)
                 old_disp = state_data["pending_calls"].get(act_id)
@@ -582,7 +604,7 @@ async def handle_receipts(run_id: str, req: Request, prefix: Optional[str] = Non
                 state_data["approval_info"]["nonce"] = nonce
                 state_data["approval_info"]["t_end"] = now_nano()
 
-        # Evaluate Next Phase
+        # Decide state machine transitions
         if retries:
             state_data["status"] = "waiting"
             state_data["dispatches"] = retries
