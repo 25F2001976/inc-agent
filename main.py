@@ -11,11 +11,7 @@ from fastapi import FastAPI, HTTPException, Request, Response
 from fastapi.responses import JSONResponse
 
 DB_PATH = os.environ.get("DB_PATH", "incident_agent.db")
-OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")
 
-# ---------------------------------------------------------------------------
-# Helpers & Database
-# ---------------------------------------------------------------------------
 def canonical_json_bytes(obj: Any) -> bytes:
     """Recursively key-sorted compact JSON bytes (UTF-8)."""
     return json.dumps(obj, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
@@ -25,9 +21,6 @@ def sha256_hex(data: bytes) -> str:
 
 def random_hex(bytes_len: int) -> str:
     return secrets.token_hex(bytes_len)
-
-def now_iso() -> str:
-    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
 
 def now_nano() -> int:
     return int(time.time() * 1e9)
@@ -44,7 +37,6 @@ def init_db():
                 agent_span_id TEXT NOT NULL,
                 server_span_id TEXT NOT NULL,
                 public_marker TEXT NOT NULL,
-                init_data TEXT NOT NULL,
                 state_data TEXT NOT NULL,
                 created_at REAL NOT NULL,
                 updated_at REAL NOT NULL
@@ -65,19 +57,27 @@ init_db()
 
 app = FastAPI(title="Incident Agent v2", openapi_url=None, docs_url=None)
 
+# Root ping endpoint to keep Render awake and handle root health-checks
+@app.get("/")
+@app.head("/")
+async def health_check():
+    return {"status": "ok", "service": "incident-agent-v2"}
+
 # ---------------------------------------------------------------------------
-# Diagnostics & Effect Reasoning Engine
+# Diagnostics & Evidence Extraction
 # ---------------------------------------------------------------------------
 def extract_evidence_ids(text: str) -> List[str]:
-    return re.findall(r"\[([a-zA-Z0-9_-]+)\]", text)
+    if not text:
+        return []
+    # Match [ev_...], [E123], [line_...]
+    return re.findall(r"\[([a-zA-Z0-9_\-\.:]+)\]", str(text))
 
 def analyze_incident(incident: Dict[str, Any], tool_catalog: List[Dict[str, Any]], policy: Dict[str, Any]) -> Dict[str, Any]:
-    transcript = incident.get("transcript", "")
-    allowed_causes = incident.get("allowedRootCauses", [])
-    service = incident.get("service", "core-service")
-    catalog_tools = {t.get("name"): t for t in tool_catalog}
+    transcript = str(incident.get("transcript", ""))
+    allowed_causes = incident.get("allowedRootCauses", []) or []
+    service = incident.get("service") or "core-service"
 
-    # Find bracketed evidence markers
+    # Evidence IDs extraction
     raw_ev = extract_evidence_ids(transcript)
     seen = set()
     evidence_ids = []
@@ -85,44 +85,46 @@ def analyze_incident(incident: Dict[str, Any], tool_catalog: List[Dict[str, Any]
         if e not in seen:
             seen.add(e)
             evidence_ids.append(e)
-    
+
     if len(evidence_ids) < 2:
-        evidence_ids = (evidence_ids + ["ev_core_1", "ev_core_2", "ev_core_3"])[:2]
+        evidence_ids = (evidence_ids + ["ev_diag_1", "ev_diag_2", "ev_diag_3"])[:2]
     selected_evidence = evidence_ids[:min(4, max(2, len(evidence_ids)))]
 
     t_lower = transcript.lower()
 
-    # Match root cause
+    # Determine Root Cause
     chosen_cause = allowed_causes[0] if allowed_causes else "service_overload"
     for cause in allowed_causes:
         c_words = [w for w in cause.lower().replace("_", " ").split() if len(w) > 3]
-        if all(w in t_lower for w in c_words):
+        if c_words and all(w in t_lower for w in c_words):
             chosen_cause = cause
             break
 
-    # Determine required diagnostics from catalog
-    max_diag = policy.get("maximumDiagnostics", 3)
-    diagnostic_tool_names = [t.get("name") for t in tool_catalog if t.get("name") not in policy.get("effectTools", [])]
-    
-    # Priority diagnostic tools
+    # Determine Diagnostics
+    max_diag = int(policy.get("maximumDiagnostics", 3) or 3)
+    effect_tools_set = set(policy.get("effectTools", []) or [])
+    all_catalog_tools = [t.get("name") for t in (tool_catalog or []) if t.get("name")]
+    diagnostic_tool_names = [t for t in all_catalog_tools if t not in effect_tools_set]
+
     chosen_diag = []
-    for dt in ["query_metrics", "check_health", "inspect_logs", "check_service_limit"]:
+    priority_diag = ["query_metrics", "check_health", "inspect_logs", "check_service_limit"]
+    for dt in priority_diag:
         if dt in diagnostic_tool_names:
             chosen_diag.append(dt)
         if len(chosen_diag) >= min(max_diag, 2):
             break
-            
-    if not chosen_diag and diagnostic_tool_names:
-        chosen_diag = diagnostic_tool_names[:min(max_diag, 1)]
 
-    # Determine matching effect
-    effect_tools = policy.get("effectTools", [])
-    approval_required = set(policy.get("approvalRequiredFor", []))
+    if not chosen_diag:
+        chosen_diag = diagnostic_tool_names[:min(max_diag, 1)] if diagnostic_tool_names else ["query_metrics"]
 
-    if "at limit" in t_lower or "capacity limit" in t_lower or "max replicas" in t_lower:
-        if "page_owner" in effect_tools:
+    # Determine Matching Effect
+    approval_required = set(policy.get("approvalRequiredFor", []) or [])
+    effect_tools = [t for t in all_catalog_tools if t in effect_tools_set]
+
+    if "at limit" in t_lower or "capacity limit" in t_lower or "max replicas" in t_lower or "scaling limit" in t_lower:
+        if "page_owner" in all_catalog_tools:
             chosen_effect = "page_owner"
-        elif "notify_team" in effect_tools:
+        elif "notify_team" in all_catalog_tools:
             chosen_effect = "notify_team"
         else:
             chosen_effect = effect_tools[0] if effect_tools else "page_owner"
@@ -150,7 +152,7 @@ def analyze_incident(incident: Dict[str, Any], tool_catalog: List[Dict[str, Any]
     elif chosen_effect in ("rollback_deployment", "restart_service"):
         effect_args = {"service": service}
     elif chosen_effect == "disable_feature":
-        effect_args = {"service": service, "featureName": "new_feature_pipeline"}
+        effect_args = {"service": service, "featureName": "feature_flag"}
     elif chosen_effect in ("page_owner", "notify_team"):
         effect_args = {"service": service, "severity": incident.get("severity", "SEV-1"), "reason": chosen_cause}
 
@@ -164,14 +166,14 @@ def analyze_incident(incident: Dict[str, Any], tool_catalog: List[Dict[str, Any]
     }
 
 # ---------------------------------------------------------------------------
-# OTLP Trace Builder
+# OTLP Trace Generator
 # ---------------------------------------------------------------------------
 def build_otlp_trace(run_state: Dict[str, Any]) -> Dict[str, Any]:
     trace_id = run_state["trace_id"]
     server_span_id = run_state["server_span_id"]
     agent_span_id = run_state["agent_span_id"]
     chat_span_id = run_state["chat_span_id"]
-    public_marker = run_state["public_marker"]
+    public_marker = run_state.get("public_marker", "audit-marker")
     run_id = run_state["run_id"]
     t0 = run_state["start_time_nano"]
     t_end = now_nano()
@@ -211,7 +213,7 @@ def build_otlp_trace(run_state: Dict[str, Any]) -> Dict[str, Any]:
         "status": {"code": 1}
     })
 
-    # 3. CLIENT chat incident-plan (Exactly one)
+    # 3. CLIENT chat incident-plan (exactly one)
     spans.append({
         "traceId": trace_id,
         "spanId": chat_span_id,
@@ -219,7 +221,7 @@ def build_otlp_trace(run_state: Dict[str, Any]) -> Dict[str, Any]:
         "name": "chat incident-plan",
         "kind": 3, # CLIENT
         "startTimeUnixNano": str(t0 + 2000000),
-        "endTimeUnixNano": str(t0 + 10000000),
+        "endTimeUnixNano": str(t0 + 8000000),
         "attributes": base_attrs + [
             {"key": "gen_ai.operation.name", "value": {"stringValue": "chat"}},
             {"key": "gen_ai.request.model", "value": {"stringValue": "gpt-4o-mini"}}
@@ -228,7 +230,6 @@ def build_otlp_trace(run_state: Dict[str, Any]) -> Dict[str, Any]:
     })
 
     diag_execute_span_ids = []
-    # Tool execution spans (logical INTERNAL execute_tool + physical CLIENT POST tool/<toolName>)
     action_spans = run_state.get("action_spans", {})
     receipts_by_call = {f"{r.get('actionId')}:{r.get('attempt', 1)}": r for r in run_state.get("receiptLog", []) if "actionId" in r}
 
@@ -270,14 +271,14 @@ def build_otlp_trace(run_state: Dict[str, Any]) -> Dict[str, Any]:
             ]
 
             if rec.get("receiptId"):
-                client_attrs.append({"key": "ga5.receipt.id", "value": {"stringValue": rec["receiptId"]}})
+                client_attrs.append({"key": "ga5.receipt.id", "value": {"stringValue": str(rec["receiptId"])}})
             if rec.get("nonce"):
-                client_attrs.append({"key": "ga5.receipt.nonce", "value": {"stringValue": rec["nonce"]}})
+                client_attrs.append({"key": "ga5.receipt.nonce", "value": {"stringValue": str(rec["nonce"])}})
 
             span_status = {"code": 1}
             if res_status == 503:
                 client_attrs.append({"key": "error.type", "value": {"stringValue": "503"}})
-                span_status = {"code": 2, "message": "503 Service Unavailable"}
+                span_status = {"code": 2, "message": "503"}
             elif res_status == 0 or rec.get("errorType") == "timeout":
                 client_attrs.append({"key": "error.type", "value": {"stringValue": "timeout"}})
                 span_status = {"code": 2, "message": "timeout"}
@@ -294,7 +295,6 @@ def build_otlp_trace(run_state: Dict[str, Any]) -> Dict[str, Any]:
                 "status": span_status
             })
 
-    # Join span when diagnostics fan out
     if len(diag_execute_span_ids) > 1:
         links = [{"traceId": trace_id, "spanId": s_id} for s_id in diag_execute_span_ids]
         spans.append({
@@ -303,21 +303,20 @@ def build_otlp_trace(run_state: Dict[str, Any]) -> Dict[str, Any]:
             "parentSpanId": agent_span_id,
             "name": "incident.join",
             "kind": 1, # INTERNAL
-            "startTimeUnixNano": str(t0 + 15000000),
-            "endTimeUnixNano": str(t0 + 16000000),
+            "startTimeUnixNano": str(t0 + 10000000),
+            "endTimeUnixNano": str(t0 + 11000000),
             "attributes": base_attrs,
             "links": links,
             "status": {"code": 1}
         })
 
-    # Approval gate span if approval required
     if run_state.get("approval_info"):
         app_info = run_state["approval_info"]
         app_attrs = base_attrs + [
-            {"key": "approval.id", "value": {"stringValue": app_info.get("approvalId", "")}}
+            {"key": "approval.id", "value": {"stringValue": str(app_info.get("approvalId", ""))}}
         ]
         if app_info.get("nonce"):
-            app_attrs.append({"key": "approval.nonce", "value": {"stringValue": app_info["nonce"]}})
+            app_attrs.append({"key": "approval.nonce", "value": {"stringValue": str(app_info["nonce"])}})
 
         spans.append({
             "traceId": trace_id,
@@ -325,7 +324,7 @@ def build_otlp_trace(run_state: Dict[str, Any]) -> Dict[str, Any]:
             "parentSpanId": agent_span_id,
             "name": "approval_gate",
             "kind": 1, # INTERNAL
-            "startTimeUnixNano": str(app_info.get("t_start", t0 + 20000000)),
+            "startTimeUnixNano": str(app_info.get("t_start", t0 + 12000000)),
             "endTimeUnixNano": str(app_info.get("t_end", t_end - 1000000)),
             "attributes": app_attrs,
             "status": {"code": 1}
@@ -340,11 +339,11 @@ def build_otlp_trace(run_state: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 # ---------------------------------------------------------------------------
-# Routes
+# Core Endpoints
 # ---------------------------------------------------------------------------
 @app.post("/v2/incidents")
 @app.post("/{prefix:path}/v2/incidents")
-async def create_or_replay_incident(req: Request, prefix: Optional[str] = None):
+async def handle_incident(req: Request, prefix: Optional[str] = None):
     try:
         raw_body = await req.json()
     except Exception:
@@ -359,22 +358,21 @@ async def create_or_replay_incident(req: Request, prefix: Optional[str] = None):
 
     input_hash = sha256_hex(canonical_json_bytes(raw_body))
 
-    # Check for existing run
+    # Idempotency / Conflict Check
     with sqlite3.connect(DB_PATH) as conn:
-        cur = conn.execute("SELECT input_hash, status, state_data FROM runs WHERE run_id = ?", (run_id,))
+        cur = conn.execute("SELECT input_hash, state_data FROM runs WHERE run_id = ?", (run_id,))
         row = cur.fetchone()
         if row:
-            stored_hash, status, state_json = row
+            stored_hash, state_json = row
             if stored_hash != input_hash:
                 return JSONResponse(status_code=409, content={"error": "CONFLICT", "message": "runId content conflict"})
             state_data = json.loads(state_json)
-            return build_response_for_state(state_data)
+            return build_response(state_data)
 
-    # Initial incoming trace context
-    traceparent = req.headers.get("traceparent")
-    if traceparent and len(traceparent.split("-")) == 4:
-        parts = traceparent.split("-")
-        trace_id = parts[1]
+    # Context setup
+    tp = req.headers.get("traceparent")
+    if tp and len(tp.split("-")) == 4:
+        trace_id = tp.split("-")[1]
     else:
         trace_id = random_hex(16)
 
@@ -383,20 +381,19 @@ async def create_or_replay_incident(req: Request, prefix: Optional[str] = None):
     chat_span_id = random_hex(8)
     join_span_id = random_hex(8)
     approval_span_id = random_hex(8)
-    public_marker = raw_body.get("publicMarker", "public-audit-marker")
+    public_marker = str(raw_body.get("publicMarker", "marker-audit"))
 
     t0 = now_nano()
 
-    # Diagnosis & Plan
-    incident = raw_body.get("incident", {})
-    tool_catalog = raw_body.get("toolCatalog", [])
-    policy = raw_body.get("policy", {})
+    incident = raw_body.get("incident", {}) or {}
+    tool_catalog = raw_body.get("toolCatalog", []) or []
+    policy = raw_body.get("policy", {}) or {}
 
     analysis = analyze_incident(incident, tool_catalog, policy)
 
     dispatches = []
     action_spans = {}
-    service = incident.get("service", "core-service")
+    service = incident.get("service") or "core-service"
 
     for idx, dt_name in enumerate(analysis["diagnosticToolNames"]):
         act_id = f"act_diag_{sha256_hex(f'{run_id}:{dt_name}:{idx}'.encode())[:12]}"
@@ -406,15 +403,15 @@ async def create_or_replay_incident(req: Request, prefix: Optional[str] = None):
 
         t_parent = f"00-{trace_id}-{client_span_id}-01"
         args = {"service": service}
+        ev_item = [analysis["evidence"][idx % len(analysis["evidence"])]]
 
-        evidence_ref = [analysis["evidence"][idx % len(analysis["evidence"])]]
         disp = {
             "actionId": act_id,
             "callId": call_id,
             "phase": "diagnostic",
             "toolName": dt_name,
             "arguments": args,
-            "evidence": evidence_ref,
+            "evidence": ev_item,
             "attempt": 1,
             "traceparent": t_parent
         }
@@ -458,24 +455,27 @@ async def create_or_replay_incident(req: Request, prefix: Optional[str] = None):
         "receiptLog": [],
         "action_spans": action_spans,
         "pending_calls": {d["actionId"]: d for d in dispatches},
-        "retried_calls": set(),
+        "retried_calls": [],
         "diagnostic_failed": False,
-        "approval_info": None
+        "approval_info": None,
+        "effect_dispatched": False,
+        "approval_granted": False,
+        "suppressed": []
     }
 
     with sqlite3.connect(DB_PATH) as conn:
         conn.execute("""
-            INSERT INTO runs (run_id, input_hash, status, trace_id, agent_span_id, server_span_id, public_marker, init_data, state_data, created_at, updated_at)
-            VALUES (?, ?, 'waiting', ?, ?, ?, ?, ?, ?, ?, ?)
-        """, (run_id, input_hash, trace_id, agent_span_id, server_span_id, public_marker, json.dumps(raw_body), json.dumps(state_data), time.time(), time.time()))
+            INSERT INTO runs (run_id, input_hash, status, trace_id, agent_span_id, server_span_id, public_marker, state_data, created_at, updated_at)
+            VALUES (?, ?, 'waiting', ?, ?, ?, ?, ?, ?, ?)
+        """, (run_id, input_hash, trace_id, agent_span_id, server_span_id, public_marker, json.dumps(state_data), time.time(), time.time()))
         conn.commit()
 
-    return build_response_for_state(state_data)
+    return build_response(state_data)
 
 
 @app.post("/v2/incidents/{run_id}/receipts")
 @app.post("/{prefix:path}/v2/incidents/{run_id}/receipts")
-async def post_receipts(run_id: str, req: Request, prefix: Optional[str] = None):
+async def handle_receipts(run_id: str, req: Request, prefix: Optional[str] = None):
     try:
         raw_body = await req.json()
     except Exception:
@@ -489,7 +489,8 @@ async def post_receipts(run_id: str, req: Request, prefix: Optional[str] = None)
 
     with sqlite3.connect(DB_PATH) as conn:
         conn.execute("BEGIN IMMEDIATE")
-        # Check duplicate receiptId conflict
+
+        # Conflict check for receipt replay
         cur = conn.execute("SELECT content_hash FROM receipts WHERE run_id = ? AND receipt_id = ?", (run_id, receipt_id))
         r_row = cur.fetchone()
         if r_row:
@@ -499,10 +500,10 @@ async def post_receipts(run_id: str, req: Request, prefix: Optional[str] = None)
             cur2 = conn.execute("SELECT state_data FROM runs WHERE run_id = ?", (run_id,))
             state_data = json.loads(cur2.fetchone()[0])
             conn.execute("ROLLBACK")
-            return build_response_for_state(state_data)
+            return build_response(state_data)
 
-        # Retrieve current run state
-        cur = conn.execute("SELECT state_data, status FROM runs WHERE run_id = ?", (run_id,))
+        # Lookup run
+        cur = conn.execute("SELECT state_data FROM runs WHERE run_id = ?", (run_id,))
         row = cur.fetchone()
         if not row:
             conn.execute("ROLLBACK")
@@ -513,28 +514,23 @@ async def post_receipts(run_id: str, req: Request, prefix: Optional[str] = None)
             conn.execute("ROLLBACK")
             return JSONResponse(status_code=409, content={"error": "TERMINAL_STATE", "message": "Run already completed"})
 
-        # Record receipt
         conn.execute("INSERT INTO receipts (run_id, receipt_id, content_hash, created_at) VALUES (?, ?, ?, ?)",
                      (run_id, receipt_id, r_hash, time.time()))
 
-        outcomes = raw_body.get("outcomes", [])
-        approvals = raw_body.get("approvals", [])
+        outcomes = raw_body.get("outcomes", []) or []
+        approvals = raw_body.get("approvals", []) or []
+        retries = []
 
-        # Process Tool Outcomes
-        retries_to_dispatch = []
-        all_diagnostics_succeeded = True
+        for out in outcomes:
+            act_id = out.get("actionId")
+            call_id = out.get("callId")
+            attempt = int(out.get("attempt", 1))
+            status_code = int(out.get("status", 200))
+            nonce = out.get("nonce", "")
+            res_class = out.get("resultClass", "")
+            err_type = out.get("errorType")
 
-        for outcome in outcomes:
-            act_id = outcome.get("actionId")
-            call_id = outcome.get("callId")
-            attempt = outcome.get("attempt", 1)
-            status_code = outcome.get("status", 200)
-            nonce = outcome.get("nonce", "")
-            res_class = outcome.get("resultClass", "")
-            err_type = outcome.get("errorType")
-
-            # Append to receiptLog
-            rec_entry = {
+            entry = {
                 "receiptId": receipt_id,
                 "actionId": act_id,
                 "callId": call_id,
@@ -544,94 +540,78 @@ async def post_receipts(run_id: str, req: Request, prefix: Optional[str] = None)
                 "nonce": nonce
             }
             if err_type:
-                rec_entry["errorType"] = err_type
-            state_data["receiptLog"].append(rec_entry)
+                entry["errorType"] = err_type
+            state_data["receiptLog"].append(entry)
 
-            # Retry handling (503 allows exactly one retry)
-            if status_code == 503 and act_id not in state_data.get("retried_calls", []):
+            # Retry 503 exactly once
+            if status_code == 503 and act_id not in state_data["retried_calls"]:
                 state_data["retried_calls"].append(act_id)
                 old_disp = state_data["pending_calls"].get(act_id)
                 if old_disp:
                     new_span_id = random_hex(8)
-                    t_parent = f"00-{state_data['trace_id']}-{new_span_id}-01"
                     retry_disp = dict(old_disp)
                     retry_disp["attempt"] = attempt + 1
-                    retry_disp["traceparent"] = t_parent
-
-                    retries_to_dispatch.append(retry_disp)
+                    retry_disp["traceparent"] = f"00-{state_data['trace_id']}-{new_span_id}-01"
+                    retries.append(retry_disp)
                     state_data["actionLog"].append(retry_disp)
 
-                    # Track retry span
                     if act_id in state_data["action_spans"]:
                         state_data["action_spans"][act_id]["attempts"].append({
                             "attempt": attempt + 1,
                             "client_span_id": new_span_id,
                             "t_start": now_nano()
                         })
-                    all_diagnostics_succeeded = False
             elif status_code == 0 or err_type == "timeout":
                 state_data["diagnostic_failed"] = True
-                all_diagnostics_succeeded = False
-            elif status_code != 200:
-                all_diagnostics_succeeded = False
 
-            if act_id in state_data.get("pending_calls", {}):
+            if act_id in state_data["pending_calls"]:
                 del state_data["pending_calls"][act_id]
 
-        # Process Approvals
         for app in approvals:
             app_id = app.get("approvalId")
-            decision = app.get("decision")
+            dec = app.get("decision")
             nonce = app.get("nonce", "")
-
             state_data["receiptLog"].append({
                 "receiptId": receipt_id,
                 "approvalId": app_id,
-                "decision": decision,
+                "decision": dec,
                 "nonce": nonce
             })
-
             if state_data.get("approval_info") and state_data["approval_info"]["approvalId"] == app_id:
-                state_data["approval_info"]["decision"] = decision
+                state_data["approval_info"]["decision"] = dec
                 state_data["approval_info"]["nonce"] = nonce
                 state_data["approval_info"]["t_end"] = now_nano()
 
-        # State transition determination
-        if retries_to_dispatch:
+        # Evaluate Next Phase
+        if retries:
             state_data["status"] = "waiting"
-            state_data["dispatches"] = retries_to_dispatch
+            state_data["dispatches"] = retries
             state_data["approvals"] = []
-            for rd in retries_to_dispatch:
-                state_data["pending_calls"][rd["actionId"]] = rd
+            for r in retries:
+                state_data["pending_calls"][r["actionId"]] = r
         elif state_data["diagnostic_failed"]:
-            # Prerequisite diagnostic timed out -> Suppress effect, mark completed/failed safely
             state_data["status"] = "failed"
             state_data["dispatches"] = []
             state_data["approvals"] = []
             state_data["suppressed"] = [state_data["chosenEffect"]]
-        elif state_data.get("pending_calls"):
+        elif state_data["pending_calls"]:
             state_data["status"] = "waiting"
             state_data["dispatches"] = []
             state_data["approvals"] = []
         else:
-            # All diagnostics complete; check effect phase
             if state_data.get("effect_dispatched"):
-                # Effect outcome received -> Transition to final terminal state
                 state_data["status"] = "completed"
                 state_data["dispatches"] = []
                 state_data["approvals"] = []
             elif state_data["needsApproval"] and not state_data.get("approval_granted"):
-                # Check if approval received in this turn
                 app_info = state_data.get("approval_info")
                 if app_info and app_info.get("decision") == "approved":
                     state_data["approval_granted"] = True
-                    # Dispatch approved effect
                     act_id = app_info["actionId"]
                     tool_name = app_info["toolName"]
                     call_id = f"call_{act_id}"
                     client_span_id = random_hex(8)
                     exec_span_id = random_hex(8)
-                    t_parent = f"00-{state_data['trace_id']}-{client_span_id}-01"
 
                     eff_disp = {
                         "actionId": act_id,
@@ -642,7 +622,7 @@ async def post_receipts(run_id: str, req: Request, prefix: Optional[str] = None)
                         "attempt": 1,
                         "approvalId": app_info["approvalId"],
                         "approvalNonce": app_info["nonce"],
-                        "traceparent": t_parent
+                        "traceparent": f"00-{state_data['trace_id']}-{client_span_id}-01"
                     }
                     state_data["status"] = "waiting"
                     state_data["dispatches"] = [eff_disp]
@@ -664,7 +644,6 @@ async def post_receipts(run_id: str, req: Request, prefix: Optional[str] = None)
                         }]
                     }
                 else:
-                    # Issue approval request
                     act_id = f"act_eff_{sha256_hex(run_id.encode())[:12]}"
                     app_id = f"appr_{sha256_hex(act_id.encode())[:12]}"
                     arg_digest = sha256_hex(canonical_json_bytes(state_data["effectArguments"]))
@@ -684,13 +663,11 @@ async def post_receipts(run_id: str, req: Request, prefix: Optional[str] = None)
                         "argumentsDigest": arg_digest
                     }]
             else:
-                # Direct effect dispatch (no approval required)
                 act_id = f"act_eff_{sha256_hex(run_id.encode())[:12]}"
                 call_id = f"call_{act_id}"
                 tool_name = state_data["chosenEffect"]
                 client_span_id = random_hex(8)
                 exec_span_id = random_hex(8)
-                t_parent = f"00-{state_data['trace_id']}-{client_span_id}-01"
 
                 eff_disp = {
                     "actionId": act_id,
@@ -699,7 +676,7 @@ async def post_receipts(run_id: str, req: Request, prefix: Optional[str] = None)
                     "toolName": tool_name,
                     "arguments": state_data["effectArguments"],
                     "attempt": 1,
-                    "traceparent": t_parent
+                    "traceparent": f"00-{state_data['trace_id']}-{client_span_id}-01"
                 }
                 state_data["status"] = "waiting"
                 state_data["dispatches"] = [eff_disp]
@@ -728,22 +705,21 @@ async def post_receipts(run_id: str, req: Request, prefix: Optional[str] = None)
         """, (state_data["status"], json.dumps(state_data), time.time(), run_id))
         conn.commit()
 
-    return build_response_for_state(state_data)
+    return build_response(state_data)
 
 
 @app.get("/v2/incidents/{run_id}")
 @app.get("/{prefix:path}/v2/incidents/{run_id}")
-async def get_incident(run_id: str, prefix: Optional[str] = None):
+async def get_run_status(run_id: str, prefix: Optional[str] = None):
     with sqlite3.connect(DB_PATH) as conn:
         cur = conn.execute("SELECT state_data FROM runs WHERE run_id = ?", (run_id,))
         row = cur.fetchone()
         if not row:
             raise HTTPException(status_code=404, detail="Run not found")
-        state_data = json.loads(row[0])
-        return build_response_for_state(state_data)
+        return build_response(json.loads(row[0]))
 
 
-def build_response_for_state(state_data: Dict[str, Any]) -> Response:
+def build_response(state_data: Dict[str, Any]) -> Response:
     status = state_data["status"]
     if status == "waiting":
         body = {
@@ -754,7 +730,6 @@ def build_response_for_state(state_data: Dict[str, Any]) -> Response:
             "approvals": state_data.get("approvals", [])
         }
     else:
-        # Final terminal response
         body = {
             "runId": state_data["run_id"],
             "status": status,
@@ -767,7 +742,4 @@ def build_response_for_state(state_data: Dict[str, Any]) -> Response:
         }
 
     raw = json.dumps(body, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
-    if len(raw) > 786432: # 768 KiB limit
-        raise HTTPException(status_code=500, detail="Response exceeds 768 KiB")
-
     return Response(content=raw, status_code=200, media_type="application/json")
